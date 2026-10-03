@@ -20,6 +20,8 @@ public final class DecisionReason {
     public static final String CACHE_MISS_COMPUTED = "CACHE_MISS_COMPUTED";
     /** 后端熔断打开，跳过该后端。 */
     public static final String CIRCUIT_OPEN_SKIPPED = "CIRCUIT_OPEN_SKIPPED";
+    /** 冷却结束后对该后端的唯一恢复试探请求成功，后端重新正常承载流量。 */
+    public static final String RECOVERY_PROBE_SUCCEEDED = "RECOVERY_PROBE_SUCCEEDED";
     /** 版本灰度权重为 0，但仍对显式版本请求提供服务（区别于未注册）。 */
     public static final String ZERO_WEIGHT_EXPLICIT = "ZERO_WEIGHT_EXPLICIT";
 }

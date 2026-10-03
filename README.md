@@ -40,7 +40,7 @@ HTTP(/score,/score/batch)
 | `gateway.model` | 请求/结果模型、稳定错误码 `GatewayErrorCode`、判定依据 `DecisionReason` |
 | `gateway.routing` | 版本规格、灰度路由器、配置纪元 |
 | `gateway.backend` | 推理后端抽象、内存后端、后端注册表、失败模式 |
-| `gateway.resilience` | 每后端熔断器（CLOSED/OPEN/HALF_OPEN）与注册表 |
+| `gateway.resilience` | 每后端自愈熔断器（CLOSED/OPEN/HALF_OPEN、逐级退避、唯一试探）、健康快照与有界状态时间线 |
 | `gateway.cache` | TTL 缓存、纪元即时失效、并发去重 |
 | `gateway.service` | 评分编排（校验→路由→兼容→缓存→熔断降级→调用） |
 | `gateway.web` | 评分接口与管理接口 |
@@ -124,18 +124,90 @@ curl -X POST "http://localhost:8080/admin/backends/cpu-v1-1/failure?mode=TIMEOUT
 - 全部后端都不可用 → 返回最后一次后端错误码（超时与内部错误仍可区分）或
   `ALL_BACKENDS_UNAVAILABLE`。
 
-### 3.3 熔断与恢复（`CircuitBreaker`）
+### 3.3 隔离、自动恢复与退避（`CircuitBreaker`）
 
-- 连续失败次数达到阈值 `gateway.circuit.failure-threshold`（默认 3）→ OPEN；
-- OPEN 期间快速失败，流量被降级到其它健康后端；
-- OPEN 持续 `gateway.circuit.open-duration-ms`（默认 5000ms）后进入 HALF_OPEN，
-  **只放行一个试探请求**：成功 → CLOSED 恢复承载流量；失败 → 重新 OPEN 并重新计时；
-- 请求非法不参与失败统计，避免脏请求打挂熔断器。
+- 连续失败次数达到阈值 `gateway.circuit.failure-threshold`（默认 3）→ **OPEN（隔离）**；
+- OPEN 期间快速失败，流量被降级到其它健康后端，尝试链里记录 `CIRCUIT_OPEN_SKIPPED`；
+- OPEN 冷却结束后**不需要人工干预**：下一个到达该后端的**真实请求**会原子地抢到唯一试探权，
+  熔断器进入 **HALF_OPEN（试探）**，状态时间线记录 `RECOVERY_PROBE_GRANTED`；
+- **同一后端同一时刻最多一个试探请求**：试探执行期间到达的其它真实请求一律被拒绝并继续走
+  健康后端，尝试链里记录 `RECOVERY_PROBE_IN_FLIGHT_SKIPPED`，不会因为反复试探把虚弱后端打挂；
+- 试探**成功** → **CLOSED（恢复）**，该后端重新正常承载流量，结果的 `decisionReason`
+  标记为 `RECOVERY_PROBE_SUCCEEDED`（与正常路由/隔离跳过明确可区分），退避计数复位；
+- 试探**失败** → 重新 OPEN，且下一次冷却时间逐级加长：
+
+  ```
+  nextBackoff = min(currentBackoff * gateway.circuit.backoff-multiplier,
+                    gateway.circuit.max-backoff-ms)
+  ```
+
+  默认首次冷却 `open-duration-ms=5000ms`、乘数 `2.0`（5s→10s→20s→40s→60s…）、
+  上限 `max-backoff-ms=60000ms`；乘数配成 `1.0` 即恒定冷却不退避。
+- 请求非法不参与失败统计，避免脏请求打挂熔断器；
+- 已返回的 `ScoreResult` 不可变，恢复链路任何后续动作都不会改写历史结果；
+  恢复后新请求稳定重新落回该后端（评分只取决于版本与特征，数值不变）。
+
+#### 自愈相关配置
+
+```properties
+gateway.circuit.failure-threshold=3      # 连续失败几次后隔离
+gateway.circuit.open-duration-ms=5000    # 首次冷却（毫秒）
+gateway.circuit.backoff-multiplier=2.0   # 试探失败后冷却退避乘数
+gateway.circuit.max-backoff-ms=60000     # 退避上限（毫秒）
+gateway.circuit.timeline-capacity=20     # 每后端状态时间线保留条数上限
+```
+
+#### 无副作用的安全观测（只读保证）
+
+所有状态/流量/恢复进度查询（`GET /admin/circuits`、
+`GET /admin/backends/{id}/health`、`GET /admin/traffic`、`GET /admin/cache`）都是**纯读**：
+
+- 连续查、并发查、高频查都**不会推进也不会打断**恢复流程：冷却结束后若没有真实流量，
+  熔断器权威状态仍是 `OPEN`，观测里只把阶段报告为 `ISOLATED_COOLDOWN_DUE`（冷却已到、
+  待真实请求触发试探），绝不替它发起试探；
+- 查询不改变之后任何请求的判定结果，也不写入状态时间线；
+- 查询本身不计入后端失败统计，也不计入灰度真实流量统计（`/admin/traffic` 的计数
+  只由 `/score` 真实请求增加）。
+
+#### 状态时间线字段含义
+
+每个后端保留最近 `gateway.circuit.timeline-capacity` 条关键状态变化
+（有界环形缓冲，写满覆盖最旧，不会无限增长；追加 O(1)，不拖慢评分主链路）。
+`GET /admin/backends/{backendId}/health` 与 `GET /admin/circuits` 返回：
+
+| 字段 | 含义 |
+|---|---|
+| `state` | 熔断器权威状态：`CLOSED` / `OPEN` / `HALF_OPEN`（只读查询不会改变它） |
+| `phase` | 面向运维的阶段：`NORMAL`（正常承载）/ `ISOLATED`（隔离冷却中）/ `ISOLATED_COOLDOWN_DUE`（冷却已到，等真实请求试探）/ `PROBING`（试探请求执行中） |
+| `failureCount` | 当前连续后端侧失败计数（成功后归零） |
+| `probeAttempt` | 第几次恢复试探（1=首次试探；正常承载阶段为 0） |
+| `currentBackoffMs` | 当前隔离冷却时长（已含逐级退避） |
+| `remainingIsolationMs` | 隔离剩余毫秒；冷却已到但试探未触发时为 0 |
+| `probeEligible` | 冷却是否已结束，下一个真实请求将拿到唯一试探权 |
+| `probeInFlight` | 当前是否已有一个试探请求正在执行 |
+| `timeline` | 最近的状态变化列表（旧→新） |
+
+`timeline` 每条记录字段：
+
+| 字段 | 含义 |
+|---|---|
+| `timestampMs` | 变化发生时间（epoch 毫秒） |
+| `from` / `to` | 变化前 / 变化后的阶段 |
+| `reason` | 变化原因：`FAILURE_THRESHOLD_REACHED`（达到阈值被隔离）/ `RECOVERY_PROBE_GRANTED`（真实请求拿到试探权）/ `RECOVERY_PROBE_SUCCEEDED`（试探成功恢复承载）/ `RECOVERY_PROBE_FAILED`（试探失败重新隔离并退避）/ `MANUAL_RESET` |
+| `failureCount` | 发生时连续失败次数 |
+| `backoffMs` | 变化后生效的冷却时长（试探失败时即为退避后的新值） |
+| `probeAttempt` | 第几次恢复试探 |
 
 观测与复位：
 
 ```bash
-curl http://localhost:8080/admin/circuits     # {"states":{"cpu-v1-1":"OPEN",...}}
+curl http://localhost:8080/admin/circuits
+# {"states":{"cpu-v1-1":"OPEN",...},"backends":{"cpu-v1-1":{"phase":"ISOLATED",
+#  "remainingIsolationMs":4821,"currentBackoffMs":5000,"probeAttempt":0,
+#  "timeline":[{"timestampMs":...,"from":"CLOSED","to":"OPEN",
+#  "reason":"FAILURE_THRESHOLD_REACHED","failureCount":3,"backoffMs":5000,"probeAttempt":0}]}}}
+
+curl http://localhost:8080/admin/backends/cpu-v1-1/health   # 单后端完整恢复进度+时间线
 curl -X POST http://localhost:8080/admin/reset  # 复位熔断 + 清缓存 + 解除失败注入（测试用）
 ```
 
@@ -202,9 +274,10 @@ curl -X POST http://localhost:8080/admin/reset  # 复位熔断 + 清缓存 + 解
 |---|---|
 | `POST /admin/families/{family}/weights` | 调整灰度权重（推进纪元、失效缓存） |
 | `POST /admin/versions` | 注册/升级新版本并挂内存后端（推进纪元） |
-| `GET /admin/traffic` | 观测实际灰度流量、生效权重、纪元 |
-| `GET /admin/circuits` | 观测各后端熔断状态 |
-| `GET /admin/cache` / `DELETE /admin/cache` | 查看缓存 / 手动清空 |
+| `GET /admin/traffic` | 只读观测实际灰度流量、生效权重、纪元（查询本身不计入流量） |
+| `GET /admin/circuits` | 只读观测各后端权威状态 + 完整自愈健康视图与状态时间线 |
+| `GET /admin/backends/{id}/health` | 只读观测单个后端阶段、剩余隔离时长、试探进度与时间线 |
+| `GET /admin/cache` / `DELETE /admin/cache` | 查看缓存（只读）/ 手动清空 |
 | `POST /admin/backends/{id}/failure?mode=` | 注入失败模式 |
 | `POST /admin/reset` | 复位（测试用） |
 
@@ -218,7 +291,7 @@ curl -X POST http://localhost:8080/admin/reset  # 复位熔断 + 清缓存 + 解
 mvn test
 ```
 
-测试覆盖三类要求场景（共 20 个用例，均为确定性、无网络依赖的内存测试 + HTTP 集成测试）：
+测试覆盖四类要求场景（共 27 个用例，均为确定性、无网络依赖的内存测试 + HTTP 集成测试）：
 
 - **灰度切换** `CanaryRoutingTest`：默认 100/0 流量、切到 0/100、显式钉住零权重版本、
   未注册拒绝（不回退）、维度不兼容拒绝、权重调整后缓存失效；
@@ -227,7 +300,13 @@ mvn test
   已完成结果在后续熔断后保持不变；
 - **并发重复请求** `ConcurrentCacheTest`：TTL 内只算一次、32 并发同键只实际计算一次且不串号、
   权重变更/版本升级失效缓存、批量顺序稳定且去重计数正确；
-- **端到端** `GatewayHttpIntegrationTest`：经真实 HTTP 验证以上链路与管理/观测接口。
+- **自愈与安全观测** `SelfHealingTest`：冷却结束后真实请求自动试探并恢复稳定承载、
+  试探失败后冷却按乘数逐级退避且受上限钳制、恢复后退避复位、
+  并发 32 准入只有 1 个试探且 16 个真实请求全部被健康后端承接（`RECOVERY_PROBE_IN_FLIGHT_SKIPPED`）、
+  冷却窗口内高频并发只读查询不推进/不打断恢复且不写时间线不计流量、
+  状态时间线有界（写满覆盖最旧）、有序、并发迁移与并发查询下不丢不乱；
+- **端到端** `GatewayHttpIntegrationTest`：经真实 HTTP 验证以上链路、管理/观测接口，
+  以及熔断健康视图字段与只读查询无副作用。
 
 ### 6.2 查看单测日志中的“请求 / 命中版本 / 判定依据”
 
@@ -247,6 +326,22 @@ mvn test
 mvn test -Dtest=CanaryRoutingTest
 mvn test -Dtest=BackendResilienceTest
 mvn test -Dtest=ConcurrentCacheTest
+mvn test -Dtest=SelfHealingTest
+mvn test -Dtest=GatewayHttpIntegrationTest
+```
+
+自愈/观测场景日志中可以看到每条用例的业务场景与每次状态迁移，例如：
+
+```
+[状态迁移] backend=cpu-v1-1 CLOSED->OPEN reason=FAILURE_THRESHOLD_REACHED failures=3 backoff=5000ms
+[自动恢复-冷却已到] backend=cpu-v1-1 phase=ISOLATED_COOLDOWN_DUE state=OPEN remaining=0ms
+[状态迁移] backend=cpu-v1-1 OPEN->HALF_OPEN reason=RECOVERY_PROBE_GRANTED attempt=1 backoff=5000ms
+[状态迁移] backend=cpu-v1-1 HALF_OPEN->CLOSED reason=RECOVERY_PROBE_SUCCEEDED attempt=1
+[状态迁移] backend=cpu-v1-1 HALF_OPEN->OPEN reason=RECOVERY_PROBE_FAILED attempt=2 nextBackoff=10000ms
+[退避上限] 试探#3 失败 下次冷却=400ms (被上限钳制)
+[并发单试探] 32 个并发准入：新增试探=0 试探进行中跳过=32
+[只读观测] 冷却窗口内 N 次并发只读查询，状态仍=OPEN/COOLDOWN_DUE，时间线未被观测改变
+[时间线有界有序] 30 轮迁移+4 个并发只读线程后保留最近5条（容量5），原因序列=[...]
 ```
 
 ### 6.3 手工联调
@@ -263,9 +358,14 @@ curl -s -X POST localhost:8080/admin/families/ml-score/weights \
   -H 'Content-Type: application/json' -d '{"ml-score-v1":90,"ml-score-v2":10}'
 curl -s localhost:8080/admin/traffic
 
-# 3) 注入超时观察降级与熔断
+# 3) 注入超时观察降级、隔离与（冷却后）自动恢复
 curl -s -X POST "localhost:8080/admin/backends/cpu-v1-1/failure?mode=TIMEOUT"
-curl -s localhost:8080/admin/circuits
+curl -s localhost:8080/admin/circuits | jq .
+curl -s localhost:8080/admin/backends/cpu-v1-1/health | jq .view.phase
+# 默认冷却 5s：解除故障后，5s 后的第一个真实评分请求会成为恢复试探并成功
+curl -s -X POST "localhost:8080/admin/backends/cpu-v1-1/failure?mode=NONE"
+# 等待 5s 后再评分，结果 decisionReason 含 RECOVERY_PROBE_SUCCEEDED；
+# 期间无论刷多少次 /admin/backends/cpu-v1-1/health 都不会替它发起试探。
 ```
 
 ---
@@ -277,4 +377,11 @@ curl -s localhost:8080/admin/circuits
 3. **不静默回退**：未注册或零权重显式请求都有明确行为，绝不偷偷落到默认版本。
 4. **变更即失效**：版本升级/权重调整推进纪元并立即清空缓存。
 5. **并发只算一次且不串号**：键级锁 + in-flight 去重 + 结果按 requestId 重绑定。
-6. **过程可解释**：每个结果都带 `decisionReason`，记录路由权重、降级尝试链、熔断跳过、缓存来源。
+6. **过程可解释**：每个结果都带 `decisionReason`，记录路由权重、降级尝试链、熔断跳过、
+   恢复试探成功（`RECOVERY_PROBE_SUCCEEDED`）/试探进行中跳过、缓存来源。
+7. **自动恢复且不压垮后端**：冷却结束由真实请求自动触发唯一试探；同一时刻同一后端最多一个
+   试探在执行，其余流量走健康后端；试探失败冷却逐级退避并受上限钳制，不会无限试探或永久隔离。
+8. **观测绝对只读**：状态/流量/恢复进度查询不推进、不打断恢复，不改判定，
+   不计失败与真实流量统计；高频并发查询看到的可用后端集合/流量/缓存结果保持一致。
+9. **状态可追溯**：每后端保留有界、有序、并发安全的状态变化时间线（时间、原因、from→to、
+   失败次数、生效冷却、试探序号），写满覆盖最旧，不无限增长。

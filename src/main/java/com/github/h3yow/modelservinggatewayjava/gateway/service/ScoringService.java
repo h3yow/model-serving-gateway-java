@@ -9,6 +9,7 @@ import com.github.h3yow.modelservinggatewayjava.gateway.model.DecisionReason;
 import com.github.h3yow.modelservinggatewayjava.gateway.model.GatewayErrorCode;
 import com.github.h3yow.modelservinggatewayjava.gateway.model.ScoreRequest;
 import com.github.h3yow.modelservinggatewayjava.gateway.model.ScoreResult;
+import com.github.h3yow.modelservinggatewayjava.gateway.resilience.AdmissionResult;
 import com.github.h3yow.modelservinggatewayjava.gateway.resilience.CircuitBreaker;
 import com.github.h3yow.modelservinggatewayjava.gateway.resilience.CircuitBreakerRegistry;
 import com.github.h3yow.modelservinggatewayjava.gateway.routing.ConfigEpoch;
@@ -127,16 +128,27 @@ public class ScoringService {
 
         for (InferenceBackend backend : candidates) {
             CircuitBreaker cb = circuits.forBackend(backend.id());
-            if (!cb.allowRequest()) {
-                attemptNotes.add(backend.id() + ":CIRCUIT_OPEN_SKIPPED");
+            AdmissionResult admission = cb.admit();
+            if (!admission.allowed()) {
+                // 隔离中跳过：冷却未到(CIRCUIT_OPEN_SKIPPED)或已有试探在执行
+                // (RECOVERY_PROBE_IN_FLIGHT_SKIPPED)，其余流量继续走健康后端
+                attemptNotes.add(backend.id() + ":" + admission.skipReason());
                 continue;
             }
             try {
                 double value = backend.score(request);
                 cb.onSuccess();
-                String reason = attemptNotes.isEmpty()
-                        ? decision.reason()
-                        : DecisionReason.FALLBACK_HEALTHY_BACKEND;
+                String reason;
+                if (admission.probe()) {
+                    // 恢复试探成功：该后端重新正常承载流量
+                    reason = DecisionReason.RECOVERY_PROBE_SUCCEEDED;
+                    log.info("[自愈恢复] request={} backend={} 试探成功，重新正常承载",
+                            reqId, backend.id());
+                } else {
+                    reason = attemptNotes.isEmpty()
+                            ? decision.reason()
+                            : DecisionReason.FALLBACK_HEALTHY_BACKEND;
+                }
                 return ScoreResult.ok(reqId, value, spec.version(), backend.id(), false,
                         annotate(decision, attemptNotes, backend.id(), reason));
             } catch (BackendException e) {
@@ -149,7 +161,14 @@ public class ScoringService {
                 }
                 // 超时 / 内部错误：计入熔断并尝试降级
                 cb.onFailure();
-                attemptNotes.add(backend.id() + ":" + code.name() + ":CB_STATE=" + cb.state());
+                String probeNote = admission.probe() ? ":RECOVERY_PROBE_FAILED" : "";
+                attemptNotes.add(backend.id() + ":" + code.name() + probeNote
+                        + ":CB_STATE=" + cb.state()
+                        + ":NEXT_BACKOFF_MS=" + cb.currentBackoffMs());
+                if (admission.probe()) {
+                    log.info("[自愈退避] request={} backend={} 试探失败，重新隔离，下次冷却={}ms",
+                            reqId, backend.id(), cb.currentBackoffMs());
+                }
             }
         }
 

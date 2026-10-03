@@ -104,6 +104,51 @@ class GatewayHttpIntegrationTest {
     }
 
     @Test
+    void circuitHealthAndTimelineAreReadOnlyOverHttp() throws Exception {
+        // 让 v1 两个后端都内部错误，连续请求把熔断打成 OPEN（阈值 3）
+        mvc.perform(post("/admin/backends/cpu-v1-1/failure").param("mode", "INTERNAL_ERROR"))
+                .andExpect(status().isOk());
+        mvc.perform(post("/admin/backends/cpu-v1-2/failure").param("mode", "INTERNAL_ERROR"))
+                .andExpect(status().isOk());
+        for (int i = 0; i < 4; i++) {
+            mvc.perform(post("/score")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"requestId\":\"trip-" + i + "\",\"requestedVersion\":\"ml-score-v1\","
+                                    + "\"features\":[1,2," + i + ".5]}"))
+                    .andExpect(status().isOk());
+        }
+
+        // 健康视图：隔离阶段 + 剩余隔离时长 + 时间线首条为达到阈值打开
+        mvc.perform(get("/admin/backends/cpu-v1-1/health"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.ok").value(true))
+                .andExpect(jsonPath("$.view.backendId").value("cpu-v1-1"))
+                .andExpect(jsonPath("$.view.state").value("OPEN"))
+                .andExpect(jsonPath("$.view.phase").value("ISOLATED"))
+                .andExpect(jsonPath("$.view.remainingIsolationMs").isNumber())
+                .andExpect(jsonPath("$.view.currentBackoffMs").value(5000))
+                .andExpect(jsonPath("$.view.timeline[0].reason").value("FAILURE_THRESHOLD_REACHED"))
+                .andExpect(jsonPath("$.view.timeline[0].from").value("CLOSED"))
+                .andExpect(jsonPath("$.view.timeline[0].to").value("OPEN"));
+
+        // 连续只读查询不得推进或打断恢复：状态、剩余隔离时长起点、时间线条数保持稳定
+        String before = mvc.perform(get("/admin/circuits"))
+                .andExpect(jsonPath("$.backends.cpu-v1-1.state").value("OPEN"))
+                .andReturn().getResponse().getContentAsString();
+        for (int i = 0; i < 20; i++) {
+            mvc.perform(get("/admin/circuits")).andExpect(status().isOk());
+            mvc.perform(get("/admin/backends/cpu-v1-1/health")).andExpect(status().isOk());
+            mvc.perform(get("/admin/traffic")).andExpect(status().isOk());
+        }
+        mvc.perform(get("/admin/backends/cpu-v1-1/health"))
+                .andExpect(jsonPath("$.view.state").value("OPEN"))
+                .andExpect(jsonPath("$.view.phase").value("ISOLATED"))
+                .andExpect(jsonPath("$.view.timeline.length()")
+                        .value(org.hamcrest.Matchers.greaterThan(0)));
+        log.info("[HTTP] 熔断健康视图/时间线字段正确，连续 60+ 次只读查询状态保持 OPEN/ISOLATED，观测无副作用");
+    }
+
+    @Test
     void batchReturnsStableResultsAndCacheCounters() throws Exception {
         String body = "{\"requests\":["
                 + "{\"requestId\":\"b1\",\"requestedVersion\":\"ml-score-v1\",\"features\":[1,1,1]},"
