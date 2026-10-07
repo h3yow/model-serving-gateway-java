@@ -9,6 +9,7 @@ import com.github.h3yow.modelservinggatewayjava.gateway.model.DecisionReason;
 import com.github.h3yow.modelservinggatewayjava.gateway.model.GatewayErrorCode;
 import com.github.h3yow.modelservinggatewayjava.gateway.model.ScoreRequest;
 import com.github.h3yow.modelservinggatewayjava.gateway.model.ScoreResult;
+import com.github.h3yow.modelservinggatewayjava.gateway.resilience.Admission;
 import com.github.h3yow.modelservinggatewayjava.gateway.resilience.CircuitBreaker;
 import com.github.h3yow.modelservinggatewayjava.gateway.resilience.CircuitBreakerRegistry;
 import com.github.h3yow.modelservinggatewayjava.gateway.routing.ConfigEpoch;
@@ -127,29 +128,52 @@ public class ScoringService {
 
         for (InferenceBackend backend : candidates) {
             CircuitBreaker cb = circuits.forBackend(backend.id());
-            if (!cb.allowRequest()) {
-                attemptNotes.add(backend.id() + ":CIRCUIT_OPEN_SKIPPED");
+            Admission admission = cb.acquire();
+            if (admission == Admission.DENY_ISOLATED) {
+                attemptNotes.add(backend.id() + ":ISOLATED_SKIPPED");
                 continue;
             }
+            boolean probe = admission == Admission.ALLOW_PROBE;
             try {
-                double value = backend.score(request);
-                cb.onSuccess();
-                String reason = attemptNotes.isEmpty()
-                        ? decision.reason()
-                        : DecisionReason.FALLBACK_HEALTHY_BACKEND;
+                double value;
+                try {
+                    value = backend.score(request);
+                } catch (BackendException e) {
+                    lastBackendError = e;
+                    GatewayErrorCode code = e.getErrorCode();
+                    if (code == GatewayErrorCode.INVALID_REQUEST) {
+                        // 非法请求：分级处理，立即失败，不熔断不降级。
+                        // 若当前调用是试探：后端能正确应答说明进程可达，视为后端恢复，
+                        // 避免熔断永远卡在 HALF_OPEN（非法请求本身不计失败统计）。
+                        if (probe) {
+                            cb.recordSuccess(true);
+                        }
+                        return ScoreResult.error(reqId, code.name(), e.getMessage(),
+                                "BACKEND_REJECTED_INVALID");
+                    }
+                    // 超时 / 内部错误：计入熔断（试探失败会重新隔离并加长冷却）并尝试降级
+                    cb.recordFailure(probe);
+                    attemptNotes.add(backend.id() + ":" + code.name()
+                            + ":CB_STATE=" + cb.viewState()
+                            + (probe ? ":PROBE_FAILED" : ""));
+                    continue;
+                }
+                cb.recordSuccess(probe);
+                String reason;
+                if (probe) {
+                    reason = DecisionReason.RECOVERED_AFTER_PROBE;
+                } else if (!attemptNotes.isEmpty()) {
+                    reason = DecisionReason.FALLBACK_HEALTHY_BACKEND;
+                } else {
+                    reason = decision.reason();
+                }
                 return ScoreResult.ok(reqId, value, spec.version(), backend.id(), false,
                         annotate(decision, attemptNotes, backend.id(), reason));
-            } catch (BackendException e) {
-                lastBackendError = e;
-                GatewayErrorCode code = e.getErrorCode();
-                if (code == GatewayErrorCode.INVALID_REQUEST) {
-                    // 非法请求：分级处理，立即失败，不熔断不降级
-                    return ScoreResult.error(reqId, code.name(), e.getMessage(),
-                            "BACKEND_REJECTED_INVALID");
+            } finally {
+                // 防御：任何意外异常都不能让唯一试探名额泄漏（否则后端将永远无法再被试探）
+                if (probe) {
+                    cb.ensureProbeReleased();
                 }
-                // 超时 / 内部错误：计入熔断并尝试降级
-                cb.onFailure();
-                attemptNotes.add(backend.id() + ":" + code.name() + ":CB_STATE=" + cb.state());
             }
         }
 

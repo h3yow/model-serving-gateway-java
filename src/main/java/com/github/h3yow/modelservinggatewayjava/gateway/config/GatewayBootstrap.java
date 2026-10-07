@@ -5,6 +5,8 @@ import com.github.h3yow.modelservinggatewayjava.gateway.backend.BackendType;
 import com.github.h3yow.modelservinggatewayjava.gateway.backend.InMemoryInferenceBackend;
 import com.github.h3yow.modelservinggatewayjava.gateway.cache.ScoringCache;
 import com.github.h3yow.modelservinggatewayjava.gateway.resilience.CircuitBreakerRegistry;
+import com.github.h3yow.modelservinggatewayjava.gateway.resilience.RecoveryPolicy;
+import com.github.h3yow.modelservinggatewayjava.gateway.resilience.TimeSource;
 import com.github.h3yow.modelservinggatewayjava.gateway.routing.CanaryRouter;
 import com.github.h3yow.modelservinggatewayjava.gateway.routing.ConfigEpoch;
 import com.github.h3yow.modelservinggatewayjava.gateway.routing.ModelVersionSpec;
@@ -57,9 +59,10 @@ public class GatewayBootstrap {
 
     @Bean
     public CircuitBreakerRegistry circuitBreakerRegistry(GatewayProperties props) {
-        return new CircuitBreakerRegistry(
-                props.getCircuit().getFailureThreshold(),
-                props.getCircuit().getOpenDurationMs());
+        GatewayProperties.CircuitProps c = props.getCircuit();
+        RecoveryPolicy policy = new RecoveryPolicy(c.getFailureThreshold(),
+                c.getInitialCooldownMs(), c.getBackoffMultiplier(), c.getMaxCooldownMs());
+        return new CircuitBreakerRegistry(policy, TimeSource.SYSTEM, c.getTimelineCapacity());
     }
 
     @Bean

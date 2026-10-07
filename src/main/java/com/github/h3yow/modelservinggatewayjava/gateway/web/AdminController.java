@@ -93,10 +93,20 @@ public class AdminController {
         return out;
     }
 
-    /** 观测各后端熔断状态。 */
+    /** 观测各后端熔断状态（只读，不推进恢复流程）。 */
     @GetMapping("/admin/circuits")
     public Map<String, Object> circuits() {
         return Map.of("states", circuits.snapshotStates());
+    }
+
+    /**
+     * 只读观测各后端自愈详情：当前阶段（CLOSED/OPEN/HALF_OPEN）、失败计数、
+     * 退避轮次、剩余隔离时长、试探是否在飞、最近关键状态变化时间线。
+     * 连续查/并发查/高频查都不推进或打断恢复，也不计入失败或流量统计。
+     */
+    @GetMapping("/admin/backends/health")
+    public Map<String, Object> backendHealth() {
+        return Map.of("backends", circuits.snapshotHealth());
     }
 
     @GetMapping("/admin/cache")

@@ -99,7 +99,7 @@ class BackendResilienceTest {
             h.service().score(req("ni-" + i));
         }
         assertEquals(CircuitState.CLOSED,
-                h.circuits().forBackend("cpu-v1-1").state(),
+                h.circuits().forBackend("cpu-v1-1").viewState(),
                 "非法请求不应计入熔断");
         // 解除注入后该后端立即可用
         TestGatewayFactory.counting(h.backends(), "cpu-v1-1").setFailureMode(FailureMode.NONE);
@@ -125,7 +125,7 @@ class BackendResilienceTest {
             last = h.service().score(req("trip-" + i));
         }
         assertFalse(last.success());
-        assertEquals(CircuitState.OPEN, h.circuits().forBackend("cpu-v1-1").state());
+        assertEquals(CircuitState.OPEN, h.circuits().forBackend("cpu-v1-1").viewState());
         log.info("[熔断打开] 连续失败后状态={} 判定依据={} 错误码={}",
                 h.circuits().snapshotStates(), last.decisionReason(), last.errorCode());
 
@@ -143,7 +143,7 @@ class BackendResilienceTest {
         TestGatewayFactory.counting(h.backends(), "cpu-v1-2").setFailureMode(FailureMode.NONE);
         ScoreResult recovered = h.service().score(req("recover-1"));
         assertTrue(recovered.success(), "冷却恢复后应重新承载流量");
-        assertEquals(CircuitState.CLOSED, h.circuits().forBackend("cpu-v1-1").state());
+        assertEquals(CircuitState.CLOSED, h.circuits().forBackend("cpu-v1-1").viewState());
         log.info("[熔断恢复] request={} 后端={} 状态=CLOSED 判定依据={}",
                 recovered.requestId(), recovered.backendId(), recovered.decisionReason());
     }
@@ -167,7 +167,7 @@ class BackendResilienceTest {
             h.service().score(new ScoreRequest("later-" + i, "v1",
                     List.of(1.0, 2.0, 3.0 + i)));
         }
-        assertEquals(CircuitState.OPEN, h.circuits().forBackend(backend).state());
+        assertEquals(CircuitState.OPEN, h.circuits().forBackend(backend).viewState());
 
         // 已完成结果对象保持不变
         assertEquals(value, good.result());

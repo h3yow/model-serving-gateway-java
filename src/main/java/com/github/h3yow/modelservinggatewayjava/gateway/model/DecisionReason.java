@@ -20,6 +20,10 @@ public final class DecisionReason {
     public static final String CACHE_MISS_COMPUTED = "CACHE_MISS_COMPUTED";
     /** 后端熔断打开，跳过该后端。 */
     public static final String CIRCUIT_OPEN_SKIPPED = "CIRCUIT_OPEN_SKIPPED";
+    /** 该后端隔离冷却到期，本次请求作为试探成功，跳后恢复正常承载。 */
+    public static final String RECOVERED_AFTER_PROBE = "RECOVERED_AFTER_PROBE";
+    /** 该后端处于隔离（冷却中或已有试探在飞），本跳被跳过、改走健康后端。 */
+    public static final String ISOLATED_SKIPPED = "ISOLATED_SKIPPED";
     /** 版本灰度权重为 0，但仍对显式版本请求提供服务（区别于未注册）。 */
     public static final String ZERO_WEIGHT_EXPLICIT = "ZERO_WEIGHT_EXPLICIT";
 }
