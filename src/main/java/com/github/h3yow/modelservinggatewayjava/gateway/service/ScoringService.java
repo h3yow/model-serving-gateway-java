@@ -127,18 +127,25 @@ public class ScoringService {
 
         for (InferenceBackend backend : candidates) {
             CircuitBreaker cb = circuits.forBackend(backend.id());
-            if (!cb.allowRequest()) {
-                attemptNotes.add(backend.id() + ":CIRCUIT_OPEN_SKIPPED");
+            CircuitBreaker.Permit permit = cb.tryAcquire();
+            if (permit == CircuitBreaker.Permit.REJECTED) {
+                attemptNotes.add(backend.id() + ":" + DecisionReason.CIRCUIT_OPEN_SKIPPED);
                 continue;
             }
             try {
                 double value = backend.score(request);
-                cb.onSuccess();
-                String reason = attemptNotes.isEmpty()
-                        ? decision.reason()
-                        : DecisionReason.FALLBACK_HEALTHY_BACKEND;
+                boolean recovered = cb.onSuccess();
+                String reason;
+                if (recovered) {
+                    // 本请求即冷却后的试探请求且成功：该后端由此恢复正常承载
+                    reason = DecisionReason.RECOVERED_SERVING;
+                } else {
+                    reason = attemptNotes.isEmpty()
+                            ? decision.reason()
+                            : DecisionReason.FALLBACK_HEALTHY_BACKEND;
+                }
                 return ScoreResult.ok(reqId, value, spec.version(), backend.id(), false,
-                        annotate(decision, attemptNotes, backend.id(), reason));
+                        toAnnotate(decision, attemptNotes, backend.id(), reason, permit));
             } catch (BackendException e) {
                 lastBackendError = e;
                 GatewayErrorCode code = e.getErrorCode();
@@ -161,15 +168,20 @@ public class ScoringService {
                 : "all backends failed for version '" + spec.version()
                         + "'; last error: " + lastBackendError.getMessage();
         return ScoreResult.error(reqId, finalCode.name(), message,
-                annotate(decision, attemptNotes, null, DecisionReason.CIRCUIT_OPEN_SKIPPED));
+                toAnnotate(decision, attemptNotes, null,
+                        DecisionReason.CIRCUIT_OPEN_SKIPPED, null));
     }
 
-    private static String annotate(RoutingDecision decision, List<String> attempts,
-                                   String chosenBackend, String reason) {
+    private static String toAnnotate(RoutingDecision decision, List<String> attempts,
+                                     String chosenBackend, String reason,
+                                     CircuitBreaker.Permit permit) {
         StringBuilder sb = new StringBuilder(reason);
         sb.append("(family=").append(decision.family())
                 .append(",pinned=").append(decision.pinned())
                 .append(",weight=").append(decision.weightUsed());
+        if (permit == CircuitBreaker.Permit.PROBE) {
+            sb.append(",hop=PROBE");
+        }
         if (!attempts.isEmpty()) {
             sb.append(",attempts=").append(attempts);
         }

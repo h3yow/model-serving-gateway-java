@@ -93,10 +93,26 @@ public class AdminController {
         return out;
     }
 
-    /** 观测各后端熔断状态。 */
+    /**
+     * 观测各后端熔断状态与自愈进度（纯只读：不推进恢复、不计入任何统计，
+     * 并发/高频/连续查询结果一致）。
+     */
     @GetMapping("/admin/circuits")
     public Map<String, Object> circuits() {
-        return Map.of("states", circuits.snapshotStates());
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("states", circuits.snapshotStates());
+        out.put("health", circuits.healthSnapshot());
+        return out;
+    }
+
+    /** 单个后端的只读健康快照：阶段、剩余冷却、退避轮次、状态时间线。 */
+    @GetMapping("/admin/backends/{backendId}/health")
+    public Map<String, Object> backendHealth(@PathVariable String backendId) {
+        var health = circuits.healthOf(backendId);
+        if (health == null) {
+            return Map.of("ok", false, "message", "unknown backend: " + backendId);
+        }
+        return Map.of("ok", true, "health", health);
     }
 
     @GetMapping("/admin/cache")

@@ -33,7 +33,6 @@ public class StateTimeline {
     }
 
     /** 只读快照：按时间正序返回最近最多 capacity 条（不推进任何状态）。 */
-    @Override
     public synchronized List<TimelineEvent> snapshot() {
         int size = size();
         List<TimelineEvent> out = new ArrayList<>(size);

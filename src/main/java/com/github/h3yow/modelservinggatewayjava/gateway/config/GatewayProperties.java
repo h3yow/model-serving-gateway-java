@@ -120,8 +120,14 @@ public class GatewayProperties {
     public static class CircuitProps {
         /** 连续失败多少次后熔断打开。 */
         private int failureThreshold = 3;
-        /** 熔断打开持续时间（毫秒），结束后进入半开试探。 */
+        /** 首次隔离冷却时长（毫秒），结束后放行一个试探请求。 */
         private long openDurationMs = 5000;
+        /** 试探失败后冷却时长的乘数（>=1，1 表示固定冷却不退避）。 */
+        private double backoffMultiplier = 2.0;
+        /** 冷却时长上限（毫秒），退避加长到此为止。 */
+        private long maxCooldownMs = 60000;
+        /** 每个后端状态时间线保留的最大条数（写满覆盖最旧）。 */
+        private int timelineCapacity = 32;
 
         public int getFailureThreshold() {
             return failureThreshold;
@@ -137,6 +143,30 @@ public class GatewayProperties {
 
         public void setOpenDurationMs(long openDurationMs) {
             this.openDurationMs = openDurationMs;
+        }
+
+        public double getBackoffMultiplier() {
+            return backoffMultiplier;
+        }
+
+        public void setBackoffMultiplier(double backoffMultiplier) {
+            this.backoffMultiplier = backoffMultiplier;
+        }
+
+        public long getMaxCooldownMs() {
+            return maxCooldownMs;
+        }
+
+        public void setMaxCooldownMs(long maxCooldownMs) {
+            this.maxCooldownMs = maxCooldownMs;
+        }
+
+        public int getTimelineCapacity() {
+            return timelineCapacity;
+        }
+
+        public void setTimelineCapacity(int timelineCapacity) {
+            this.timelineCapacity = timelineCapacity;
         }
     }
 

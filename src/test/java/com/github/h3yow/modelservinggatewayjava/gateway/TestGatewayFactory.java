@@ -5,6 +5,8 @@ import com.github.h3yow.modelservinggatewayjava.gateway.backend.BackendType;
 import com.github.h3yow.modelservinggatewayjava.gateway.backend.InMemoryInferenceBackend;
 import com.github.h3yow.modelservinggatewayjava.gateway.cache.ScoringCache;
 import com.github.h3yow.modelservinggatewayjava.gateway.resilience.CircuitBreakerRegistry;
+import com.github.h3yow.modelservinggatewayjava.gateway.resilience.RecoveryPolicy;
+import com.github.h3yow.modelservinggatewayjava.gateway.resilience.TimeSource;
 import com.github.h3yow.modelservinggatewayjava.gateway.routing.CanaryRouter;
 import com.github.h3yow.modelservinggatewayjava.gateway.routing.ConfigEpoch;
 import com.github.h3yow.modelservinggatewayjava.gateway.routing.ModelVersionSpec;
@@ -46,6 +48,15 @@ public final class TestGatewayFactory {
      */
     public static Harness build(int circuitThreshold, long openDurationMs, long cacheTtlMs,
                                 long backendLatencyMs) {
+        return build(new RecoveryPolicy(circuitThreshold, openDurationMs, 1.0d, openDurationMs),
+                TimeSource.SYSTEM, cacheTtlMs, backendLatencyMs);
+    }
+
+    /**
+     * 完整构建：可注入自愈退避策略与时间源（测试用手动时钟确定性推进冷却）。
+     */
+    public static Harness build(RecoveryPolicy policy, TimeSource clock, long cacheTtlMs,
+                                long backendLatencyMs) {
         ConfigEpoch epoch = new ConfigEpoch();
         CanaryRouter router = new CanaryRouter(epoch);
         router.registerVersion(new ModelVersionSpec("v1", "ml-score", 3));
@@ -59,10 +70,30 @@ public final class TestGatewayFactory {
         backends.register(new CountingBackend("edge-v2-1", BackendType.EDGE, "v2", backendLatencyMs));
 
         CircuitBreakerRegistry circuits =
-                new CircuitBreakerRegistry(circuitThreshold, openDurationMs);
+                new CircuitBreakerRegistry(policy, clock,
+                        com.github.h3yow.modelservinggatewayjava.gateway.resilience
+                                .CircuitBreaker.DEFAULT_TIMELINE_CAPACITY);
         ScoringCache cache = new ScoringCache(cacheTtlMs);
         ScoringService service = new ScoringService(router, backends, circuits, cache, epoch);
         return new Harness(service, router, backends, circuits, cache, epoch);
+    }
+
+    /** 手动时钟：测试确定性推进冷却与退避。 */
+    public static final class ManualClock implements TimeSource {
+        private final java.util.concurrent.atomic.AtomicLong now;
+
+        public ManualClock(long startMs) {
+            this.now = new java.util.concurrent.atomic.AtomicLong(startMs);
+        }
+
+        @Override
+        public long nowMs() {
+            return now.get();
+        }
+
+        public void advance(long ms) {
+            now.addAndGet(ms);
+        }
     }
 
     public static CountingBackend counting(BackendRegistry registry, String backendId) {
